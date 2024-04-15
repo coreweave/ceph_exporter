@@ -15,7 +15,9 @@
 package ceph
 
 import (
+	"bytes"
 	"context"
+	"encoding/gob"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -23,6 +25,8 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -262,6 +266,27 @@ type mdsStatus struct {
 	Uptime             float64 `json:"uptime"`
 }
 
+type mdsLabels struct {
+	FSName    string
+	MDSName   string
+	State     string
+	OpType    string
+	FSOpType  string
+	FlagPoint string
+	Inode     string
+}
+
+func (ml mdsLabels) Hash() string {
+	var b bytes.Buffer
+	gob.NewEncoder(&b).Encode(ml)
+	return b.String()
+}
+
+func (ml *mdsLabels) UnHash(hash string) error {
+	return gob.NewDecoder(strings.NewReader(hash)).Decode(ml)
+
+}
+
 type mdsSlowOp struct {
 	Ops []struct {
 		// Custom fields for easy parsing by caller.
@@ -361,7 +386,11 @@ func (m *MDSCollector) collectMDSSlowOps() {
 			return
 		}
 
+		var metricMap sync.Map
+
 		for _, op := range mso.Ops {
+			var ml mdsLabels
+
 			if op.TypeData.OpType == "client_request" {
 				opd, err := extractOpFromDescription(op.Description)
 				if err != nil {
@@ -369,42 +398,44 @@ func (m *MDSCollector) collectMDSSlowOps() {
 					continue
 				}
 
-				select {
-				case m.ch <- prometheus.MustNewConstMetric(
-					m.MDSBlockedOps,
-					prometheus.CounterValue,
-					1,
-					mss.FsName,
-					mdsName,
-					mss.State,
-					op.TypeData.OpType,
-					opd.fsOpType,
-					op.TypeData.FlagPoint,
-					opd.inode,
-				):
-				default:
-				}
-
-				continue
+				ml.FSOpType = opd.fsOpType
+				ml.Inode = opd.inode
 			}
+
+			ml.FSName = mss.FsName
+			ml.MDSName = mdsName
+			ml.State = mss.State
+			ml.OpType = op.TypeData.OpType
+			ml.FlagPoint = op.TypeData.FlagPoint
+
+			cnt, _ := metricMap.LoadOrStore(ml.Hash(), new(int32))
+			v := cnt.(*int32)
+			atomic.AddInt32(v, 1)
+		}
+
+		metricMap.Range(func(key, value any) bool {
+			var ml mdsLabels
+			ml.UnHash(fmt.Sprint(key))
+			v := value.(*int32)
 
 			select {
 			case m.ch <- prometheus.MustNewConstMetric(
 				m.MDSBlockedOps,
 				prometheus.CounterValue,
-				1,
-				mss.FsName,
-				mdsName,
-				mss.State,
-				op.TypeData.OpType,
-				"",
-				op.TypeData.FlagPoint,
-				"",
+				float64(*v),
+				ml.FSName,
+				ml.MDSName,
+				ml.State,
+				ml.OpType,
+				ml.FSOpType,
+				ml.FlagPoint,
+				ml.Inode,
 			):
 			default:
 			}
-		}
 
+			return true
+		})
 	}
 }
 
